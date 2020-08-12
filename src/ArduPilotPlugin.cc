@@ -389,6 +389,8 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
   GZ_ASSERT(_model, "ArduPilotPlugin _model pointer is null");
   GZ_ASSERT(_sdf, "ArduPilotPlugin _sdf pointer is null");
 
+  gzmsg << "Loading ArduPilotPlugin..." << std::endl;
+
   this->dataPtr->model = _model;
   this->dataPtr->modelName = this->dataPtr->model->GetName();
 
@@ -621,6 +623,16 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
 
     this->dataPtr->controls.push_back(control);
     controlSDF = controlSDF->GetNextElement("control");
+
+    // @DEBUG_INFO
+    gzmsg << "channel:    "  << control.channel << std::endl;
+    gzmsg << "cmd:        "  << control.cmd << std::endl;
+    gzmsg << "type:       "  << control.type << std::endl;
+    gzmsg << "useForce:   "  << control.useForce << std::endl;
+    gzmsg << "jointName:  "  << control.jointName << std::endl;
+    gzmsg << "multiplier: "  << control.multiplier << std::endl;
+    gzmsg << "offset:     "  << control.offset << std::endl;
+
   }
 
   // Get sensors
@@ -684,7 +696,10 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
             << "] not found, abort ArduPilot plugin.\n" << "\n";
       return;
     }
-  }
+  } 
+  gzmsg << "iimu_sensor:  " << this->dataPtr->imuSensor->Name() << std::endl;
+
+
 /* NOT MERGED IN MASTER YET
     // Get GPS
   std::string gpsName = _sdf->Get("imuName", static_cast<std::string>("gps_sensor")).first;
@@ -830,7 +845,7 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
   this->dataPtr->updateConnection = event::Events::ConnectWorldUpdateBegin(
       std::bind(&ArduPilotPlugin::OnUpdate, this));
 
-  gzlog << "[" << this->dataPtr->modelName << "] "
+  gzmsg << "[" << this->dataPtr->modelName << "] "
         << "ArduPilot ready to fly. The force will be with you" << std::endl;
 }
 
@@ -923,7 +938,7 @@ void ArduPilotPlugin::ApplyMotorForces(const double _dt)
         const double posTarget = this->dataPtr->controls[i].cmd;
         const double pos = this->dataPtr->controls[i].joint->Position();
         const double error = pos - posTarget;
-        const double force = this->dataPtr->controls[i].pid.Update(error, _dt);
+        const double force = this->dataPtr->controls[i].pid.Update(error, _dt);        
         this->dataPtr->controls[i].joint->SetForce(0, force);
       }
       else if (this->dataPtr->controls[i].type == "EFFORT")
@@ -945,6 +960,11 @@ void ArduPilotPlugin::ApplyMotorForces(const double _dt)
       else if (this->dataPtr->controls[i].type == "POSITION")
       {
         this->dataPtr->controls[i].joint->SetPosition(0, this->dataPtr->controls[i].cmd);
+
+        // @DEBUG_INFO - joint positions...
+        gzmsg << "joint: " << this->dataPtr->controls[i].joint->GetName()
+              << ", pos: " << this->dataPtr->controls[i].cmd << std::endl;
+
       }
       else if (this->dataPtr->controls[i].type == "EFFORT")
       {
