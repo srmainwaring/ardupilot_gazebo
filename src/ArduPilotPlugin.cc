@@ -131,6 +131,7 @@ class Control
   /// \brief Control type. Can be:
   /// VELOCITY control velocity of joint
   /// POSITION control position of joint
+  /// POSITION_LIMIT control position of joint
   /// EFFORT control effort of joint
   public: std::string type;
 
@@ -389,7 +390,7 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
   GZ_ASSERT(_model, "ArduPilotPlugin _model pointer is null");
   GZ_ASSERT(_sdf, "ArduPilotPlugin _sdf pointer is null");
 
-  gzmsg << "Loading ArduPilotPlugin..." << std::endl;
+  gzmsg << "Loading ArduPilotPlugin...\n";
 
   this->dataPtr->model = _model;
   this->dataPtr->modelName = this->dataPtr->model->GetName();
@@ -464,11 +465,12 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
 
     if (control.type != "VELOCITY" &&
         control.type != "POSITION" &&
+        control.type != "POSITION_LIMIT" &&
         control.type != "EFFORT")
     {
       gzwarn << "[" << this->dataPtr->modelName << "] "
              << "Control type [" << control.type
-             << "] not recognized, must be one of VELOCITY, POSITION, EFFORT."
+             << "] not recognized, must be one of VELOCITY, POSITION, POSITION_LIMIT, EFFORT."
              << " default to VELOCITY.\n";
       control.type = "VELOCITY";
     }
@@ -497,6 +499,14 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
             << "Couldn't find specified joint ["
             << control.jointName << "]. This plugin will not run.\n";
       return;
+    }
+
+    // Must be set if using SetPosition (see gazebo_ros_control for example)
+    if (control.useForce == 0 && control.type == "POSITION")
+    {
+      // TODO - get effort limit from the joint...
+      control.joint->SetParam("fmax", 0, 1000);
+      gzmsg << "Set effort limit on joint " << control.joint->GetName() << " to 1000\n";
     }
 
     if (controlSDF->HasElement("multiplier"))
@@ -625,13 +635,13 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
     controlSDF = controlSDF->GetNextElement("control");
 
     // @DEBUG_INFO
-    gzmsg << "channel:    "  << control.channel << std::endl;
-    gzmsg << "cmd:        "  << control.cmd << std::endl;
-    gzmsg << "type:       "  << control.type << std::endl;
-    gzmsg << "useForce:   "  << control.useForce << std::endl;
-    gzmsg << "jointName:  "  << control.jointName << std::endl;
-    gzmsg << "multiplier: "  << control.multiplier << std::endl;
-    gzmsg << "offset:     "  << control.offset << std::endl;
+    gzmsg << "channel:    "  << control.channel << "\n";
+    gzmsg << "cmd:        "  << control.cmd << "\n";
+    gzmsg << "type:       "  << control.type << "\n";
+    gzmsg << "useForce:   "  << control.useForce << "\n";
+    gzmsg << "jointName:  "  << control.jointName << "\n";
+    gzmsg << "multiplier: "  << control.multiplier << "\n";
+    gzmsg << "offset:     "  << control.offset << "\n";
 
   }
 
@@ -697,7 +707,7 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
       return;
     }
   } 
-  gzmsg << "iimu_sensor:  " << this->dataPtr->imuSensor->Name() << std::endl;
+  gzmsg << "iimu_sensor:  " << this->dataPtr->imuSensor->Name() << "\n";
 
 
 /* NOT MERGED IN MASTER YET
@@ -846,7 +856,7 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
       std::bind(&ArduPilotPlugin::OnUpdate, this));
 
   gzmsg << "[" << this->dataPtr->modelName << "] "
-        << "ArduPilot ready to fly. The force will be with you" << std::endl;
+        << "ArduPilot ready to fly. The force will be with you\n";
 }
 
 /////////////////////////////////////////////////
@@ -854,22 +864,23 @@ void ArduPilotPlugin::OnUpdate()
 {
   std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
 
-  const gazebo::common::Time curTime =
-    this->dataPtr->model->GetWorld()->SimTime();
+  // Update time step for PID
+  const gazebo::common::Time currTime = this->dataPtr->model->GetWorld()->SimTime();
+  const gazebo::common::Time stepTime = currTime - this->dataPtr->lastControllerUpdateTime;
+  this->dataPtr->lastControllerUpdateTime = currTime;
 
   // Update the control surfaces and publish the new state.
-  if (curTime > this->dataPtr->lastControllerUpdateTime)
+  double dt = stepTime.Double();
+
+  if (dt > 0.0)
   {
     this->ReceiveMotorCommand();
     if (this->dataPtr->arduPilotOnline)
     {
-      this->ApplyMotorForces((curTime -
-        this->dataPtr->lastControllerUpdateTime).Double());
+      this->ApplyMotorForces(dt);
       this->SendState();
     }
   }
-
-  this->dataPtr->lastControllerUpdateTime = curTime;
 }
 
 /////////////////////////////////////////////////
@@ -920,31 +931,67 @@ bool ArduPilotPlugin::InitArduPilotSockets(sdf::ElementPtr _sdf) const
 void ArduPilotPlugin::ApplyMotorForces(const double _dt)
 {
   // update velocity PID for controls and apply force to joint
-  for (size_t i = 0; i < this->dataPtr->controls.size(); ++i)
+  for (auto&& control : this->dataPtr->controls)
   {
-    if (this->dataPtr->controls[i].useForce)
+    if (control.useForce)
     {
-      if (this->dataPtr->controls[i].type == "VELOCITY")
+      if (control.type == "VELOCITY")
       {
-        const double velTarget = this->dataPtr->controls[i].cmd /
-          this->dataPtr->controls[i].rotorVelocitySlowdownSim;
-        const double vel = this->dataPtr->controls[i].joint->GetVelocity(0);
+        const double velTarget = control.cmd /
+          control.rotorVelocitySlowdownSim;
+        const double vel = control.joint->GetVelocity(0);
         const double error = vel - velTarget;
-        const double force = this->dataPtr->controls[i].pid.Update(error, _dt);
-        this->dataPtr->controls[i].joint->SetForce(0, force);
+        const double force = control.pid.Update(error, _dt);
+        control.joint->SetForce(0, force);
       }
-      else if (this->dataPtr->controls[i].type == "POSITION")
+      else if (control.type == "POSITION_LIMIT")
       {
-        const double posTarget = this->dataPtr->controls[i].cmd;
-        const double pos = this->dataPtr->controls[i].joint->Position();
-        const double error = pos - posTarget;
-        const double force = this->dataPtr->controls[i].pid.Update(error, _dt);        
-        this->dataPtr->controls[i].joint->SetForce(0, force);
+        // Control a limit (for sail under tension)
+        const double pos = control.joint->Position();
+        const double pos_sgn = pos < 0.0 ? -1.0 : 1.0;
+
+        // Target position will be in [0, pos_max] (positive),
+        // we set it to have the same sign as the current position
+        const double pos_target = pos_sgn * control.cmd;
+
+        // Now calculate the error and update the controller
+        const double error = pos - pos_target;
+        double force = control.pid.Update(error, _dt);
+
+        // Only apply tension forces (when |pos_target| < |pos|)
+        if (force * pos_sgn > 0)
+        {
+          force = 0.0;
+        }
+
+        control.joint->SetForce(0, force);
+
+        // @DEBUG_INFO
+        gzmsg << "target: " << pos_target
+              << ", pos: "  << pos
+              << ", error: "  << error
+              << ", force: "  << force
+              << "\n";
       }
-      else if (this->dataPtr->controls[i].type == "EFFORT")
+      else if (control.type == "POSITION")
       {
-        const double force = this->dataPtr->controls[i].cmd;
-        this->dataPtr->controls[i].joint->SetForce(0, force);
+        const double pos_target = control.cmd;
+        const double pos = control.joint->Position();
+        const double error = pos - pos_target;
+        const double force = control.pid.Update(error, _dt);
+        control.joint->SetForce(0, force);
+
+        // @DEBUG_INFO
+        // gzmsg << "target: "  << pos_target
+        //       << ", pos: "   << pos
+        //       << ", error: " << error
+        //       << ", force: " << force
+        //       << "\n";
+      }
+      else if (control.type == "EFFORT")
+      {
+        const double force = control.cmd;
+        control.joint->SetForce(0, force);
       }
       else
       {
@@ -953,23 +1000,18 @@ void ArduPilotPlugin::ApplyMotorForces(const double _dt)
     }
     else
     {
-      if (this->dataPtr->controls[i].type == "VELOCITY")
+      if (control.type == "VELOCITY")
       {
-        this->dataPtr->controls[i].joint->SetVelocity(0, this->dataPtr->controls[i].cmd);
+        control.joint->SetVelocity(0, control.cmd);
       }
-      else if (this->dataPtr->controls[i].type == "POSITION")
+      else if (control.type == "POSITION")
       {
-        this->dataPtr->controls[i].joint->SetPosition(0, this->dataPtr->controls[i].cmd);
-
-        // @DEBUG_INFO - joint positions...
-        gzmsg << "joint: " << this->dataPtr->controls[i].joint->GetName()
-              << ", pos: " << this->dataPtr->controls[i].cmd << std::endl;
-
+        control.joint->SetPosition(0, control.cmd, true);
       }
-      else if (this->dataPtr->controls[i].type == "EFFORT")
+      else if (control.type == "EFFORT")
       {
-        const double force = this->dataPtr->controls[i].cmd;
-        this->dataPtr->controls[i].joint->SetForce(0, force);
+        const double force = control.cmd;
+        control.joint->SetForce(0, force);
       }
       else
       {
@@ -1026,7 +1068,7 @@ void ArduPilotPlugin::ReceiveMotorCommand()
   if (counter > 0)
   {
     gzdbg << "[" << this->dataPtr->modelName << "] "
-          << "Drained n packets: " << counter << std::endl;
+          << "Drained n packets: " << counter << "\n";
   }
 
   if (recvSize == -1)
@@ -1091,7 +1133,7 @@ void ArduPilotPlugin::ReceiveMotorCommand()
           this->dataPtr->controls[i].cmd =
             this->dataPtr->controls[i].multiplier *
             (this->dataPtr->controls[i].offset + cmd);
-          // gzdbg << "apply input chan[" << this->dataPtr->controls[i].channel
+          // gzmsg << "apply input chan[" << this->dataPtr->controls[i].channel
           //       << "] to control chan[" << i
           //       << "] with joint name ["
           //       << this->dataPtr->controls[i].jointName
@@ -1099,6 +1141,12 @@ void ArduPilotPlugin::ReceiveMotorCommand()
           //       << pkt.motorSpeed[this->dataPtr->controls[i].channel]
           //       << "] adjusted cmd [" << this->dataPtr->controls[i].cmd
           //       << "].\n";
+          // gzmsg << "chan[" << this->dataPtr->controls[i].channel
+          //       << "], joint[" << i
+          //       << "], raw[" << pkt.motorSpeed[this->dataPtr->controls[i].channel]
+          //       << "], cmd[" << this->dataPtr->controls[i].cmd
+          //       << "], name[" << this->dataPtr->controls[i].jointName
+          //       << "]\n";
         }
         else
         {
