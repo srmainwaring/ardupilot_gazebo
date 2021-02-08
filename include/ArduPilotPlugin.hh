@@ -97,6 +97,10 @@ namespace gazebo
     /// \brief Initialise flight dynamics model socket
     private: bool InitSockets(sdf::ElementPtr _sdf) const;
 
+    
+    private: void LoadSonarSensors(sdf::ElementPtr _sdf);
+    public: void OnSonarStamped(ConstSonarStampedPtr &_sonarMsg, int _sensorIndex);
+
     /// \brief Private data pointer.
     private: std::unique_ptr<ArduPilotPluginPrivate> dataPtr;
   };

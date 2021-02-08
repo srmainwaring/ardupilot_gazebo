@@ -14,12 +14,16 @@
  * limitations under the License.
  *
 */
-#include <functional>
+#include "ArduPilotPlugin.hh"
 
+#include <functional>
 #include <mutex>
 #include <string>
 #include <sstream>
 #include <vector>
+
+#include <boost/algorithm/string.hpp>
+
 #include <sdf/sdf.hh>
 #include <ignition/math/Filter.hh>
 #include <gazebo/common/Assert.hh>
@@ -27,12 +31,11 @@
 #include <gazebo/msgs/msgs.hh>
 #include <gazebo/sensors/sensors.hh>
 #include <gazebo/transport/transport.hh>
-#include "ArduPilotPlugin.hh"
-
-#include "Socket.h"
 
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
+
+#include "Socket.h"
 
 // MAX_MOTORS limits the maximum number of <control> elements that
 // can be defined in the <plugin>.
@@ -124,6 +127,29 @@ double Control::kDefaultRotorVelocitySlowdownSim = 10.0;
 double Control::kDefaultFrequencyCutoff = 5.0;
 double Control::kDefaultSamplingRate = 0.2;
 
+/////////////////////////////////////////////////
+/// \brief A wrapper class to enable Subscribe() to register the std::function callback 
+template<typename M>
+class OnMessageWrapper
+{
+public:
+    typedef std::function<void(const boost::shared_ptr<M const>&)> callback_t;
+    callback_t callback_;
+
+    OnMessageWrapper(const callback_t& callback) : callback_(callback) {}
+
+    inline void OnMessage(const boost::shared_ptr<M const> &_msg)
+    {
+        if (callback_)
+        {
+           callback_(_msg);
+        }
+    }
+};
+
+typedef std::shared_ptr<OnMessageWrapper<msgs::SonarStamped>> SonarOnMessageWrapperPtr;
+
+/////////////////////////////////////////////////
 // Private data class
 class gazebo::ArduPilotPluginPrivate
 {
@@ -197,6 +223,16 @@ class gazebo::ArduPilotPluginPrivate
   /// \brief Last received frame count from the ArduPilot controller
   public: uint32_t fcu_frame_count = -1;
 
+  ////////// NEW NEW NEW NEW //////////
+  // @TODO document and reorganise
+  public: gazebo::physics::WorldPtr world;
+  public: transport::NodePtr node;
+  public: std::vector<transport::SubscriberPtr> sonarSubs;
+
+  public: std::vector<SonarOnMessageWrapperPtr> sonarCbs;
+
+  // @TODO we will also want to keep last updated info for sensor data
+  public: std::vector<double> sonarRanges;
 };
 
 /////////////////////////////////////////////////
@@ -210,6 +246,20 @@ ArduPilotPlugin::ArduPilotPlugin()
 /////////////////////////////////////////////////
 ArduPilotPlugin::~ArduPilotPlugin()
 {
+    // reset sensor subscription ptr
+    for (auto&& sub : this->dataPtr->sonarSubs) {
+        sub.reset();
+    }
+    this->dataPtr->sonarSubs.clear();
+
+    // finalise the node and reset ptr
+    // if (this->dataPtr->node) {
+    //     this->dataPtr->node->Fini();
+    // }
+    // this->dataPtr->node.reset();
+
+    // reset connection ptr
+    this->dataPtr->updateConnection.reset();
 }
 
 /////////////////////////////////////////////////
@@ -247,6 +297,7 @@ void ArduPilotPlugin::Load(physics::ModelPtr _model, sdf::ElementPtr _sdf)
   this->LoadImuSensors(_sdf);
   this->LoadGpsSensors(_sdf);
   this->LoadRangeSensors(_sdf);
+  this->LoadSonarSensors(_sdf);
 
   // Controller time control.
   this->dataPtr->lastControllerUpdateTime = 0;
@@ -718,6 +769,115 @@ void ArduPilotPlugin::LoadRangeSensors(sdf::ElementPtr _sdf)
 }
 
 /////////////////////////////////////////////////
+void ArduPilotPlugin::LoadSonarSensors(sdf::ElementPtr _sdf)
+{
+    struct SensorIdentifier {
+        std::string type;
+        int index;
+        std::string topic;
+    };
+    std::vector<SensorIdentifier> sensorIds;
+
+    // read sensor elements
+    sdf::ElementPtr sensorSdf;
+    if (_sdf->HasElement("sensor")) {
+        sensorSdf = _sdf->GetElement("sensor");
+    }
+
+    while (sensorSdf) {
+        SensorIdentifier sensorId;
+
+        // <type> is required
+        if (sensorSdf->HasElement("type")) {
+            sensorId.type = sensorSdf->Get<std::string>("type");
+        } else {
+            gzerr << "[" << this->dataPtr->modelName << "] "
+                <<  "sensor element 'type' not specified, skipping.\n";
+        } 
+
+        // <index> is required
+        if (sensorSdf->HasElement("index")) {
+            sensorId.index = sensorSdf->Get<int>("index");
+        } else {
+            gzerr << "[" << this->dataPtr->modelName << "] "
+                <<  "sensor element 'index' not specified, skipping.\n";
+        } 
+
+        // <topic> is required
+        if (sensorSdf->HasElement("topic")) {
+            sensorId.topic = sensorSdf->Get<std::string>("topic");
+        } else {
+            gzerr << "[" << this->dataPtr->modelName << "] "
+                <<  "sensor element 'topic' not specified, skipping.\n";
+        } 
+
+        sensorIds.push_back(sensorId);
+
+        sensorSdf = sensorSdf->GetNextElement("sensor");
+
+        gzdbg << "[" << this->dataPtr->modelName << "] sonar "
+            << "type: " << sensorId.type
+            << ", index: " << sensorId.index
+            << ", topic: " << sensorId.topic
+            << "\n";
+    }
+
+    // @TODO - associate each subscription with an index for the sensors
+    //       - could use bind to populate an additional argument...
+
+
+    // @TODO - move to Load
+    // world ptr
+    this->dataPtr->world = this->dataPtr->model->GetWorld();
+
+    // @TODO - move to Ctor and Load
+    // create and initialise transport node
+    this->dataPtr->node = transport::NodePtr(new transport::Node());
+    this->dataPtr->node->Init(this->dataPtr->world->Name());
+
+    // @TODO - move to own function
+    // get the topic prefix
+    std::string topicPrefix = "~/";
+    topicPrefix += this->dataPtr->modelName;
+    boost::replace_all(topicPrefix, "::", "/");
+
+    // subscriptions
+    for (auto&& sensorId : sensorIds) {
+        // @TODO - move to own function
+        // fully qualified topic name
+        std::string topicName = topicPrefix;
+        topicName.append("/").append(sensorId.topic);
+
+        // bind the sensor index to the callback function (adjust from unit to zero offset) 
+        OnMessageWrapper<msgs::SonarStamped>::callback_t fn = std::bind(
+            &ArduPilotPlugin::OnSonarStamped, this,
+            std::placeholders::_1,
+            sensorId.index - 1);
+
+        // wrap the std::function so we can register the callback
+        auto callbackWrapper = SonarOnMessageWrapperPtr(
+            new OnMessageWrapper<msgs::SonarStamped>(fn));
+
+        auto callback = &OnMessageWrapper<msgs::SonarStamped>::OnMessage;
+
+        // subscribe to sonar sensor topic
+        transport::SubscriberPtr sonarSub =
+            this->dataPtr->node->Subscribe<msgs::SonarStamped>(
+                topicName, callback, callbackWrapper.get());
+
+        this->dataPtr->sonarSubs.push_back(sonarSub);
+        this->dataPtr->sonarCbs.push_back(callbackWrapper);
+
+        // @TODO initalise ranges properly (AP convention for ignored value?)
+        this->dataPtr->sonarRanges.push_back(-1.0);
+
+        gzdbg << "[" << this->dataPtr->modelName << "] subscribing to "
+            << topicName << "\n";
+   }
+
+}
+
+/////////////////////////////////////////////////
 void ArduPilotPlugin::OnUpdate()
 {
   std::lock_guard<std::mutex> lock(this->dataPtr->mutex);
@@ -1167,8 +1327,38 @@ void ArduPilotPlugin::SendState() const
     //      rng_6 : 0
     //      windvane : { direction: 0, speed: 0 }
 
-    // writer.Key("rng_1");
-    // writer.Double(0.0);
+    // @TODO this makes a strong assumption all range
+    //       sensors with index less than sonarRanges.size()
+    //       are active
+
+    // Use case fall through to set each range sensor
+    switch (this->dataPtr->sonarRanges.size())
+    {
+    case 10:
+    case 9:
+    case 8:
+    case 7:
+    case 6:
+        writer.Key("rng_6");
+        writer.Double(this->dataPtr->sonarRanges[5]);
+    case 5:
+        writer.Key("rng_5");
+        writer.Double(this->dataPtr->sonarRanges[4]);
+    case 4:
+        writer.Key("rng_4");
+        writer.Double(this->dataPtr->sonarRanges[3]);
+    case 3:
+        writer.Key("rng_3");
+        writer.Double(this->dataPtr->sonarRanges[2]);
+    case 2:
+        writer.Key("rng_2");
+        writer.Double(this->dataPtr->sonarRanges[1]);
+    case 1:
+        writer.Key("rng_1");
+        writer.Double(this->dataPtr->sonarRanges[0]);
+    default:
+        break;
+    }
 
     // writer.Key("windvane");
     // writer.StartObject();
@@ -1177,6 +1367,8 @@ void ArduPilotPlugin::SendState() const
     // writer.Key("speed");
     // writer.Double(5.5);
     // writer.EndObject();
+
+    writer.EndObject();
 
     // send JSON
     std::string json_str = "\n" + std::string(s.GetString()) + "\n";
@@ -1188,4 +1380,45 @@ void ArduPilotPlugin::SendState() const
     // gzdbg << "sent " << bytes_sent <<  " bytes to " 
     //     << this->dataPtr->fcu_address << ":" << this->dataPtr->fcu_port_out << "\n";
     // gzdbg << json_str << "\n";
+}
+
+
+/////////////////////////////////////////////////
+/// \brief Handle sensor messages
+///
+/// Message structure:
+///     gazebo/msgs/time.proto
+///     gazebo/msgs/sonar.proto
+///     gazebo/msgs/sonar_stamped.proto
+///
+void ArduPilotPlugin::OnSonarStamped(ConstSonarStampedPtr &_sonarMsg, int _sensorIndex)
+{
+    // extract data
+    auto time_sec = _sonarMsg->time().sec();
+    auto time_nsec = _sonarMsg->time().nsec();
+    auto frame = _sonarMsg->sonar().frame();
+    auto world_pose = _sonarMsg->sonar().world_pose();
+    auto range_min = _sonarMsg->sonar().range_min();
+    auto range_max = _sonarMsg->sonar().range_max();
+    auto radius = _sonarMsg->sonar().radius();
+    auto range = _sonarMsg->sonar().range();
+    auto contact = _sonarMsg->sonar().contact();
+    auto geometry = _sonarMsg->sonar().geometry();
+
+    // Set the range for this sensor
+    this->dataPtr->sonarRanges[_sensorIndex] = range;
+
+    // gzdbg << "Sonar\n"
+    //     << "index: " << _sensorIndex << "\n"
+    //     << "frame: " << frame << "\n"
+    //     << "range_min: " << range_min << "\n"
+    //     << "range_max: " << range_max << "\n"
+    //     << "range: " << range << "\n"
+    //     << "radius: " << radius << "\n"
+    //     << "geometry: " << geometry << "\n"
+    //     << "contact: "
+    //         << contact.x() << ", "
+    //         << contact.y() << ", "
+    //         << contact.z()
+    //     << "\n";
 }

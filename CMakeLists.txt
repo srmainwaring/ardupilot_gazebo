@@ -163,6 +163,10 @@ add_executable(SocketExample
     src/Socket.cpp
 )
 
+add_executable(StdFunctionBindExample
+    src/StdFunctionBindExample.cc
+)
+
 if("${GAZEBO_VERSION}" VERSION_LESS "8.0")
     add_library(GimbalSmall2dPlugin SHARED src/GimbalSmall2dPlugin.cc)
     target_link_libraries(GimbalSmall2dPlugin ${GAZEBO_LIBRARIES})
